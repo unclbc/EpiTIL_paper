@@ -1,0 +1,485 @@
+---
+title: "Elastic Net Final Model using 383k probes - Full dataset, alpha 0.1"
+author: "Siyao Liu, Ph.D. | Lineberger Bioinformatics Core"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output: 
+  rmdformats::downcute:
+      self_contained: true
+      thumbnails: false
+      lightbox: true
+      gallery: false
+      highlight: kate
+      toc_float: yes
+      toc_depth: 3
+      theme: cosmo
+      code_folding: hide
+params:
+  r33_data: "/datastore/lbcfs/labs/bioinformatics/wdgong/projects/Nancy_Thomas/TIL-prediction/data/r33_preProcessed.Rdata"
+  til_image: "/datastore/lbcfs/labs/bioinformatics/wdgong/projects/Nancy_Thomas/TIL-prediction/data/Alg5_selectedROI_091719.txt" # Image data from Shannon #ProcessedFiles_071118/CellrAnalysis_per_Slide_20170103-Alg4_350u_PGEM1599excluded_273added_groupByMaxNumberNucleus.txt
+  estF: "/datastore/lbcfs/labs/bioinformatics/wdgong/projects/Nancy_Thomas/TIL-prediction/results/Deconvolution/MethylDecon.rds" # data matrix from ../results/Deconvolution/Deconvolution_PGEM.Rmd
+# Use EpiDISH (RPC, CBS and CP) and MethylResolver to estimate T cell percentage
+# EpiDISH_CP provides the best R2 with IHC measured CD3+ T cell percentage (See ../results/Deconvolution/Decon.Til.scatter.pdf)
+  BestAlpha: 0.1
+  process_dir: "./processedData/"
+  results_dir: "./results/"
+  colors_file: "./scripts/R/colors.R"
+
+  knit_rdir: "/datastore/nextgenout5/share/labs/bioinformatics/siyao/projects/Thomas-Edmiston_20240711_PredictTILs/" 
+knit: (function(input_file, encoding) {
+  rmarkdown::render(input_file, 
+                              output_dir="/datastore/nextgenout5/share/labs/bioinformatics/siyao/projects/Thomas-Edmiston_20240711_PredictTILs/")}) 
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{=html}
+<style>
+mark {
+  background-color: #E6E6FA;
+  color: #000;
+  border: 1px solid #E6E6FA;
+  border-radius: 5px;
+  font-family: monospace;
+  
+}
+
+.page-content code {
+  background: #E6E6FA;
+  color: #000;
+}
+
+code {
+  background: #E6E6FA;
+  background-color: #E6E6FA;
+  color: #000;
+  border: 1px solid #E6E6FA;
+  border-radius: 5px;
+  font-family: monospace;
+}
+
+code-out {
+  background-color: #E6E6FA;
+  color: #000;
+  border: 1px solid #E6E6FA;
+  border-radius: 2px;
+}
+</style>
+```
+
+
+# Purpose
+
+# Set up
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, eval = TRUE, message = FALSE, warning = FALSE)
+# root dir is for input and necessary files 
+# knitr outdir (html) is set in yaml header
+# setting root.dir here creates process.dir and results.dir in user directory
+# but will cause issues with input files if absolute paths are not used.
+knitr::opts_knit$set(root.dir = params$knit_rdir)
+```
+
+## Load libraries
+
+```{r}
+library(kableExtra)
+library(caret)
+library(glmnet)
+library(dplyr)
+library(ggplot2)
+library(RColorBrewer)
+library(ComplexHeatmap)
+library(circlize)
+library(ggrepel)
+library(reshape2)
+library(randomForest)
+library(xgboost)
+library(cowplot)
+library(grid)
+library(gridExtra)
+library(data.table)
+```
+
+## Functions
+
+```{r, load-functions}
+theme_90 <- function() {
+  theme_bw(base_size=12)+
+    theme(panel.grid.major = element_blank(), 
+          panel.grid.minor = element_blank(),
+          axis.text.x=element_text(angle=90,hjust = 1,vjust = 0.5),
+          axis.text=element_text(color="black"),
+          panel.background=element_rect(color="black"),
+          strip.text = element_text(size=12),
+          strip.background = element_rect(fill="white"))
+}
+
+theme_45 <- function() {
+  theme_bw(base_size=14)+
+    theme(panel.grid.major = element_blank(), 
+          panel.grid.minor = element_blank(),
+          axis.text.x=element_text(angle=45,hjust = 1.0,vjust = 1.0),
+          axis.text=element_text(color="black"),
+          panel.background=element_rect(color="black"),
+          strip.text = element_text(size=12),
+          strip.background = element_rect(fill="white"))
+}
+
+theme_0 <- function() {
+  theme_bw(base_size=14)+
+    theme(panel.grid.major = element_blank(), 
+          panel.grid.minor = element_blank(),
+      axis.text=element_text(color="black"),
+      panel.background=element_rect(color="black"),
+      strip.text = element_text(size=12),
+      strip.background = element_rect(fill="white"))
+}
+```
+
+
+## Parameters
+
+```{r, echo=FALSE, results="asis"}
+p <- unlist(list(params), recursive = FALSE)
+params.df <- data.frame(Parameter=names(p), Value=as.character(p))
+kable(params.df, booktabs = TRUE) %>%
+  kableExtra::kable_styling(font_size = 12)
+```
+
+
+# Import data
+
+## Load Matrix X: 80 Melanoma samples x 383K QC'ed probes
+
+```{r}
+sub.xb <- readRDS(file="/datastore/nextgenout5/share/labs/bioinformatics/siyao/projects/Siyao_20230908_PredictTILs/processedData/231002_r33_383kProbes_Til-perc.rds")
+dim(sub.xb)
+##[1]     80 383232
+```
+
+### Create X and Y
+
+```{r}
+all.x <- sub.xb[, -which(colnames(sub.xb) %in% c("outcome", "outcome_cat", "TotalT"))]
+dim(all.x)
+
+# response: CD3TIL perc
+all.y <- sub.xb$outcome
+length(all.y)
+```
+
+### log10 transform y
+
+```{r}
+# log10 transform y since y looks right skewed
+C <- 0.01
+all.y <- log10(all.y + C)
+head(all.y)
+```
+
+
+
+# Build final model using full data
+
+```{r}
+alpha <- params$BestAlpha
+
+# set up foldid to allow comparisons 
+set.seed(10)
+    
+SAMPLE_IDS <- rownames(all.x)
+nFold <- 10
+# randomly shuffle the labels and cut into equal bins
+folds.list <- split(SAMPLE_IDS[sample(length(SAMPLE_IDS))],
+               cut(seq_along(SAMPLE_IDS), breaks = nFold, labels = FALSE))
+# convert to a data frame
+folds.df <- do.call("cbind", folds.list)
+colnames(folds.df) <- paste0("fold.", 1:nFold)
+# convert from wide to long
+folds.df2 <- reshape::melt(folds.df)
+# reorder folds.df2 to be in the same order as train_x
+folds.df2 <- folds.df2[match(rownames(all.x), folds.df2$value), ]
+identical(folds.df2$value, rownames(all.x))
+foldid <- as.numeric(gsub("fold.", "", folds.df2$X2))
+head(foldid)
+##[1]  8  7  8  5  9 10
+```
+
+
+
+```{r}
+# k-fold cross-validation for glmnet
+final.obj <- glmnet::cv.glmnet(x = as.matrix(all.x), 
+                         y = all.y, 
+                         family = "gaussian", 
+                         type.measure = "mse", #based on mean squared error criterion (default for gaussian)
+                         alpha = alpha, 
+                         nfolds = nFold,
+                         foldid = foldid)
+# check coefficient
+model.probe <- data.frame(as.matrix(coef(final.obj, s = "lambda.1se")))
+model.probe <- model.probe[model.probe$s1 != 0,, drop = F]
+# check how many probes have nonzero coeffcient
+dim(model.probe) ## 49
+```
+
+
+```{r, fig.width=6.5, fig.height=5}
+plot(final.obj)
+```
+
+
+```{r}
+write.table(model.probe, 
+            paste0("results/383k_FinalModel_logY_c0.01_alpha0.1/glmnet_log_y_c0.01_FinalModel", 
+                   "_", "alpha", params$BestAlpha, "_ProbeCoef.txt"), 
+            sep = "\t", quote = F)
+```
+
+
+# Understand the biology of final selected probes
+
+## Map selected probes to genes. Are they associated with infiltrating T cells?
+
+```{r}
+if (!require("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+BiocManager::install("IlluminaHumanMethylation450kanno.ilmn12.hg19", 
+                     force=TRUE)
+library(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+```
+
+
+### Get annotations for all probes in the data
+
+```{r}
+data("IlluminaHumanMethylation450kanno.ilmn12.hg19")
+anno <- getAnnotation(IlluminaHumanMethylation450kanno.ilmn12.hg19) # IlluminaHumanMethylation450kanno.ilmn12.hg19@data$Other
+anno <- anno[ rownames(anno) %in% colnames(all.x), ]
+```
+
+### Annotate the probes selected from the final model
+
+```{r}
+head(rownames(model.probe)[-1])
+final.model <- merge(model.probe, anno, by = "row.names")
+write.table(final.model, file="results/383k_FinalModel_logY_c0.01_alpha0.1/FinalModel_ProbeAnno.txt",
+            sep="\t")
+
+final.model$Gene <- unlist(lapply(final.model$UCSC_RefGene_Name, function(x){
+  x <- strsplit(x, split = ";")[[1]]
+  x <- unique(x)
+  if(length(x) == 0){
+    return(NA)
+  }else{
+    return(paste(x, collapse = ",", sep = ""))
+  }
+}))
+dim(final.model)
+```
+
+### Save annotation in pdf
+
+```{r}
+pdf("results/383k_FinalModel_logY_c0.01_alpha0.1/FinalModel.annotation.pdf", width = 12, height = 20)
+t1 <- gridExtra::tableGrob(data.frame(final.model[!is.na(final.model$Gene), 
+                                       c("Name", "chr", "pos", "Gene", "Relation_to_Island", "Regulatory_Feature_Group")]), rows = NULL)
+grid.arrange(t1)
+
+t1 <- gridExtra::tableGrob(data.frame(final.model[!is.na(final.model$Gene), c("Name", "chr", "pos", "Gene")]), rows = NULL)
+grid.arrange(t1)
+dev.off()
+```
+
+
+### Go term enrichment analysis 
+
+```{r}
+all.genes <- anno[anno$UCSC_RefGene_Name != "", ]
+all.genes <- lapply(all.genes$UCSC_RefGene_Name, function(x){
+  x <- strsplit(x, split = ";")[[1]]
+  x <- unique(x)
+  return(x)
+})
+all.genes <- unique(unlist(all.genes))
+length(all.genes)
+##[1] 2195822
+head(all.genes)
+##[1] "RBL2"    "C3orf35" "FNDC3B"  "VDAC3"   "ACTN1"   "ATP2A1" 
+
+degs <- final.model
+degs <- lapply(degs$UCSC_RefGene_Name, function(x){
+  x <- strsplit(x, split = ";")[[1]]
+  x <- unique(x)
+  return(x)
+})
+degs <- unique(unlist(degs))
+length(degs)
+##32
+head(degs)
+##[1] "UXS1"    "ANKRD11" "FAM105A" "OR2W1"   "CNTN5"   "GRK5" 
+```
+
+
+### GO terms
+
+```{r}
+library(topGO)
+library(org.Hs.eg.db)
+library(grid)
+library(gridExtra)
+
+geneList <- ifelse(all.genes %in% degs, 1, 0)
+names(geneList) <- all.genes
+
+# Create topGOdata object
+GOdata <- new("topGOdata",
+              ontology = "BP", # use biological process ontology
+              allGenes = geneList,
+              geneSelectionFun = function(x)(x == 1),
+              annot = annFUN.org, mapping = "org.Hs.eg.db", ID = "symbol")
+
+# Run Fisher's test
+resultFisher <- runTest(GOdata, algorithm = "elim", statistic = "fisher")
+# Extract table
+go.res <- GenTable(GOdata, Fisher = resultFisher, 
+                   topNodes = length(resultFisher@score), numChar = 60)
+# Save result
+write.table(go.res, 
+            file = paste("results/383k_FinalModel_logY_c0.01_alpha0.1/FinalModel", ".GO.txt", sep = ""),
+            quote = F, sep = "\t", row.names = F)
+```
+
+### Top 20 GO terms
+
+```{r}
+sub.go <- go.res[go.res$Fisher < 0.01, ]
+sub.go$logp <- -log10(as.numeric(sub.go$Fisher))
+sub.go <- sub.go[!duplicated(sub.go$Term), ]
+sub.go$Term <- factor(sub.go$Term, levels = rev(sub.go$Term))
+
+
+pdf(file="results/383k_FinalModel_logY_c0.01_alpha0.1/FinalModel.GO.top20.pdf", width = 8, height=4)
+ggplot(sub.go[1:20,], aes(x = Term, y = logp)) +
+  geom_bar(stat = "identity") +
+  scale_y_continuous() +
+  labs(x = "GO terms", y = "-log10 pval") +
+  theme_0() + 
+  geom_hline(yintercept=-log10(0.01), lty=2) + 
+  coord_flip() + ggtitle("Top 20 GO terms")
+dev.off()
+```
+
+
+
+# Generate Figure2B using selected probes from the final model
+
+```{r}
+# load r33 preprocessed data
+load(params$r33_data)
+y$r33_Sample_ID <- paste("X", y$r33_Sample_ID,".AVG_Beta", sep="")
+y <- y[y$r33_Sample_ID %in% colnames(xb), ]
+length(y)
+##[1] 252
+head(y)
+
+xb <- xb[, y$r33_Sample_ID]
+dim(xb)
+##[1] 383229    257
+dim(x)
+##[1] 383229    257
+```
+
+
+## Boxplot as Weida's Figure 2B
+
+```{r, fig.width=6, fig.height=5}
+library(RColorBrewer)
+til.col <- RColorBrewer::brewer.pal(3, "Set1")
+names(til.col) <- c("absent", "nonbrisk", "brisk")
+
+# get final predictions
+pred <- as.data.frame(predict(final.obj, newx = as.matrix(all.x), s = "lambda.1se"))
+#plot(pred$lambda.1se, all.y)
+identical(rownames(pred), rownames(all.x))
+
+pred.df <- data.frame("Name"=rownames(pred), 
+                      "log_TIL"=all.y,
+                      "Pred"=pred$lambda.1se)
+
+merge.df <- merge(pred.df, y, 
+                  by.x="Name", by.y="r33_Sample_ID", sort=FALSE)
+table(merge.df$tilcat2)
+merge.df$tilcat3 <- plyr::mapvalues(
+    merge.df$tilcat2,
+    from = c(0, 1, 2),
+    to = c("absent", "nonbrisk", "brisk")
+  )
+table(merge.df$tilcat3)
+
+plot.df <- merge.df[, c("tilcat3", "log_TIL", "Pred")]
+plot.df.long <- melt(plot.df, id.vars = "tilcat3")
+
+
+plot.df.long$tilcat3 <- factor(plot.df.long$tilcat3, levels = c("absent", "nonbrisk", "brisk"))
+plot.df.long$variable <- factor(plot.df.long$variable, levels=c("Pred", "log_TIL"))
+
+ggplot(plot.df.long[!is.na(plot.df.long$tilcat3), ], aes(x=tilcat3, y=value, fill=variable)) +
+  geom_boxplot(outlier.shape = NA, position = position_dodge()) +
+  geom_point(size = 1, color="grey35", position = position_jitterdodge()) +
+  ggtitle(paste0("Final model: ", (dim(model.probe)[1]-1), " probes")) +
+  scale_fill_manual("", values=c("salmon", "turquoise"), labels=c("Prediction", "TIL")) +
+  theme_0() + xlab("") + 
+  ylab("log10 (Percentage of CD3+ T cells + 0.01)")
+```
+
+
+## Scatterplot for each tilcat category
+
+```{r}
+plot.df$tilcat3 <- factor(plot.df$tilcat3, 
+                          levels = c("absent", "nonbrisk", "brisk"))
+ggplot(plot.df[!is.na(plot.df$tilcat3), ], aes(log_TIL, Pred, fill=tilcat3)) +
+  geom_point(shape=21, color="grey", size=2.5) + 
+  scale_fill_manual("", values=c("absent"="firebrick", 
+                                 "brisk"="goldenrod", 
+                                 "nonbrisk"="royalblue")) + 
+  theme_0()
+```
+
+## Facet by tumor grade
+
+```{r, fig.width=9, fig.height=3.5}
+ggplot(plot.df[!is.na(plot.df$tilcat3), ], 
+       aes(log_TIL, Pred, color=tilcat3)) +
+  geom_point() + 
+  geom_smooth(method=lm, aes(fill=tilcat3))+ 
+  scale_color_manual("", values=c("absent"="firebrick", 
+                                 "brisk"="goldenrod", 
+                                 "nonbrisk"="royalblue")) + 
+  scale_fill_manual("", values=c("absent"="firebrick", 
+                                 "brisk"="goldenrod", 
+                                 "nonbrisk"="royalblue")) + 
+  facet_grid(.~tilcat3) +
+  ggpubr::stat_cor(aes(label=..rr.label..)) +
+  theme_0() + 
+  theme(legend.position = "none") 
+```
+
+
+
+
+# R Session Information
+<details>
+<summary>Information about R, the OS and attached or loaded packages</summary>
+```{r sesion_info}
+pander::pander(sessionInfo(), compact = FALSE)
+```
+</details>
+***
+<center>`r format(Sys.time(), '%d %B %Y')`</center>
+
+
+

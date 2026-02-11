@@ -1,0 +1,338 @@
+---
+title: "Elastic Net Model using 383k probes - Model Performance using Alpha=0.1"
+author: "Siyao Liu, Ph.D. | Lineberger Bioinformatics Core"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output: 
+  rmdformats::downcute:
+      self_contained: true
+      thumbnails: false
+      lightbox: true
+      gallery: false
+      highlight: kate
+      toc_float: yes
+      toc_depth: 3
+      theme: cosmo
+      code_folding: hide
+params:
+  r33_data: "/datastore/lbcfs/labs/bioinformatics/wdgong/projects/Nancy_Thomas/TIL-prediction/data/r33_preProcessed.Rdata"
+  til_image: "/datastore/lbcfs/labs/bioinformatics/wdgong/projects/Nancy_Thomas/TIL-prediction/data/Alg5_selectedROI_091719.txt" # Image data from Shannon #ProcessedFiles_071118/CellrAnalysis_per_Slide_20170103-Alg4_350u_PGEM1599excluded_273added_groupByMaxNumberNucleus.txt
+  estF: "/datastore/lbcfs/labs/bioinformatics/wdgong/projects/Nancy_Thomas/TIL-prediction/results/Deconvolution/MethylDecon.rds" # data matrix from ../results/Deconvolution/Deconvolution_PGEM.Rmd
+# Use EpiDISH (RPC, CBS and CP) and MethylResolver to estimate T cell percentage
+# EpiDISH_CP provides the best R2 with IHC measured CD3+ T cell percentage (See ../results/Deconvolution/Decon.Til.scatter.pdf)
+  BestAlpha: 0.1
+  process_dir: "./processedData/"
+  results_dir: "./results/"
+  colors_file: "./scripts/R/colors.R"
+  n_fold: 10
+
+  knit_rdir: "/datastore/nextgenout5/share/labs/bioinformatics/siyao/projects/Thomas-Edmiston_20240711_PredictTILs/" 
+knit: (function(input_file, encoding) {
+  rmarkdown::render(input_file, 
+                              output_dir="/datastore/nextgenout5/share/labs/bioinformatics/siyao/projects/Thomas-Edmiston_20240711_PredictTILs/")}) 
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{=html}
+<style>
+mark {
+  background-color: #E6E6FA;
+  color: #000;
+  border: 1px solid #E6E6FA;
+  border-radius: 5px;
+  font-family: monospace;
+  
+}
+
+.page-content code {
+  background: #E6E6FA;
+  color: #000;
+}
+
+code {
+  background: #E6E6FA;
+  background-color: #E6E6FA;
+  color: #000;
+  border: 1px solid #E6E6FA;
+  border-radius: 5px;
+  font-family: monospace;
+}
+
+code-out {
+  background-color: #E6E6FA;
+  color: #000;
+  border: 1px solid #E6E6FA;
+  border-radius: 2px;
+}
+</style>
+```
+
+
+# Purpose
+
+# Set up
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, eval = TRUE, message = FALSE, warning = FALSE)
+# root dir is for input and necessary files 
+# knitr outdir (html) is set in yaml header
+# setting root.dir here creates process.dir and results.dir in user directory
+# but will cause issues with input files if absolute paths are not used.
+knitr::opts_knit$set(root.dir = params$knit_rdir)
+```
+
+## Load libraries
+
+```{r}
+library(kableExtra)
+library(caret)
+library(glmnet)
+library(dplyr)
+library(ggplot2)
+library(RColorBrewer)
+library(ComplexHeatmap)
+library(circlize)
+library(ggrepel)
+library(reshape2)
+library(randomForest)
+library(xgboost)
+library(cowplot)
+```
+
+## Functions
+
+```{r, load-functions}
+theme_90 <- function() {
+  theme_bw(base_size=12)+
+    theme(panel.grid.major = element_blank(), 
+          panel.grid.minor = element_blank(),
+          axis.text.x=element_text(angle=90,hjust = 1,vjust = 0.5),
+          axis.text=element_text(color="black"),
+          panel.background=element_rect(color="black"),
+          strip.text = element_text(size=12),
+          strip.background = element_rect(fill="white"))
+}
+
+theme_45 <- function() {
+  theme_bw(base_size=14)+
+    theme(panel.grid.major = element_blank(), 
+          panel.grid.minor = element_blank(),
+          axis.text.x=element_text(angle=45,hjust = 1.0,vjust = 1.0),
+          axis.text=element_text(color="black"),
+          panel.background=element_rect(color="black"),
+          strip.text = element_text(size=12),
+          strip.background = element_rect(fill="white"))
+}
+
+theme_0 <- function() {
+  theme_bw(base_size=14)+
+    theme(panel.grid.major = element_blank(), 
+          panel.grid.minor = element_blank(),
+      axis.text=element_text(color="black"),
+      panel.background=element_rect(color="black"),
+      strip.text = element_text(size=12),
+      strip.background = element_rect(fill="white"))
+}
+```
+
+
+## Parameters
+
+```{r, echo=FALSE, results="asis"}
+p <- unlist(list(params), recursive = FALSE)
+params.df <- data.frame(Parameter=names(p), Value=as.character(p))
+kable(params.df, booktabs = TRUE) %>%
+  kableExtra::kable_styling(font_size = 12)
+```
+
+
+# Import data
+
+## Load Matrix X: 80 Melanoma samples x 383K QC'ed probes
+
+```{r}
+sub.xb <- readRDS(file="/datastore/nextgenout5/share/labs/bioinformatics/siyao/projects/Siyao_20230908_PredictTILs/processedData/231002_r33_383kProbes_Til-perc.rds")
+dim(sub.xb)
+##[1]     80 383232
+```
+
+### Create X and Y
+
+```{r}
+all.x <- sub.xb[, -which(colnames(sub.xb) %in% c("outcome", "outcome_cat", "TotalT"))]
+dim(all.x)
+
+# response: CD3TIL perc
+all.y <- sub.xb$outcome
+length(all.y)
+```
+
+### log10 transform y
+
+```{r}
+# log10 transform y since y looks right skewed
+C <- 0.01
+all.y <- log10(all.y + C)
+head(all.y)
+```
+
+
+# Evaluate model performance
+
+## Manually create 10 folds in the whole dataset
+
+```{r}
+set.seed(555)
+SAMPLE_IDS <- rownames(all.x)
+n_fold <- params$n_fold
+# randomly shuffle the labels
+folds <- split(SAMPLE_IDS[sample(length(SAMPLE_IDS))],
+               cut(seq_along(SAMPLE_IDS), breaks = n_fold, labels = FALSE))
+```
+
+## Loop around each fold
+
+```{r}
+# set up a data frame to store results
+stat.df <- data.frame()
+for (i in 1:length(folds)) {
+  
+  print(paste0("Fold ", i, " ..."))
+  head(folds[[i]])
+  ##[1] "X1289.AVG_Beta" "X793.AVG_Beta"  "X682.AVG_Beta"  "X1296.AVG_Beta" "X1179.AVG_Beta" "X1283.AVG_Beta"
+  test_rows <- folds[[i]]
+  train_x <- all.x[-which(rownames(all.x) %in% test_rows), ]
+  train_y <- all.y[-which(rownames(all.x) %in% test_rows)]
+
+  test_x <- all.x[which(rownames(all.x) %in% test_rows), ]
+  test_y <- all.y[which(rownames(all.x) %in% test_rows)]
+  
+  alpha <- params$BestAlpha
+  
+  # set up foldid to allow comparisons 
+    set.seed(10)
+    
+    SAMPLE_IDS <- rownames(train_x)
+    nFold <- 10
+    # randomly shuffle the labels and cut into equal bins
+    folds.list <- split(SAMPLE_IDS[sample(length(SAMPLE_IDS))],
+               cut(seq_along(SAMPLE_IDS), breaks = nFold, labels = FALSE))
+    # convert to a data frame
+    folds.df <- do.call("cbind", folds.list)
+    colnames(folds.df) <- paste0("fold.", 1:nFold)
+    # convert from wide to long
+    folds.df2 <- reshape::melt(folds.df)
+    # reorder folds.df2 to be in the same order as train_x
+    folds.df2 <- folds.df2[match(rownames(train_x), folds.df2$value), ]
+    identical(folds.df2$value, rownames(train_x))
+    foldid <- as.numeric(gsub("fold.", "", folds.df2$X2))
+    head(foldid)
+    ##[1]  6 10 10  7  6 10
+  
+  
+  obj <- glmnet::cv.glmnet(x = as.matrix(train_x), 
+                           y = train_y, 
+                           family = "gaussian", 
+                           type.measure = "mse", #based on mean squared error criterion (default for gaussian)
+                           alpha = alpha, 
+                           nfolds = nFold,
+                           foldid = foldid)
+  
+  pred <- predict(obj, newx = as.matrix(test_x), s = "lambda.1se")
+  
+  assess.out <- glmnet::assess.glmnet(pred, newy = test_y, 
+                                      family = "gaussian", s = "lambda.1se") # lambda.1se is default
+  
+  
+  # check coefficient
+  model.probe <- data.frame(as.matrix(coef(obj, s = "lambda.1se")))
+  model.probe <- model.probe[model.probe$s1 != 0,, drop = F]
+  
+  # check how many probes have nonzero coeffcient
+  dim(model.probe) ## 165
+  write.table(model.probe, 
+              paste0("results/383k_ModelPerformance_logY_c0.01/TenFoldCV_Alpha0.1/glmnet_log_y_c0.01_fold", i, 
+                     "_", "alpha", params$BestAlpha, "_ProbeCoef.txt"), 
+              sep = "\t", quote = F)
+  
+  
+  # Model performance metrics
+  stat.df <- rbind(stat.df, data.frame(MSE = as.numeric(assess.out$mse),
+                                       MAE = as.numeric(assess.out$mae),
+                                       RMSE = RMSE(pred, test_y), # root mean square error: sqrt(mean((pred - obs)^2
+                                       Rsquare = as.numeric(R2(pred, test_y))))
+  write.table(stat.df, 
+              paste0("results/383k_ModelPerformance_logY_c0.01/TenFoldCV_Alpha0.1/glmnet_log_y_c0.01_alpha", params$BestAlpha, "_ValidationMetric.txt"), 
+              sep = "\t", quote = F, row.names = TRUE,  col.names=NA)
+  
+}
+
+stat.df
+```
+
+## Plot metircs
+
+```{r, fig.width=5, fig.height=5}
+plot.df <- stat.df
+mean(plot.df$MSE)
+median(plot.df$MSE)
+median(plot.df$Rsquare)
+
+plot.df$Split <- factor(as.character(c(1:5)), levels=c(1:5))
+plot.df.m <- reshape::melt(plot.df, id="Split")
+head(plot.df.m)
+
+# make barplot with error bars
+library(dplyr)
+df.summary <- plot.df.m %>%
+  group_by(variable) %>%
+  summarise(
+    sd = sd(value, na.rm = TRUE),
+    mean = mean(value)
+  )
+df.summary
+#variable      sd  value
+#<fct>      <dbl>  <dbl>
+#1 MSE      0.0208 0.0682
+#2 MAE      0.0367 0.220 
+#3 RMSE     0.0396 0.258 
+#4 Rsquare  0.166  0.632
+
+p <- ggplot(df.summary, aes(x=variable, y=mean, fill=variable)) + 
+  geom_bar(stat="identity", color="black"#, position=position_dodge()
+  ) +
+  geom_errorbar(aes(ymin=mean-sd, ymax=mean+sd), 
+                width=0.2#,
+                #position=position_dodge(.9)
+  ) +
+  theme_45() + theme(legend.position = "none") +
+  xlab("Metric") + ylab("Value") +
+  ggtitle(paste0("Ten fold cross val, log10(y+0.01) \nalpha=", params$BestAlpha))
+p
+```
+
+### Save plot
+
+```{r}
+pdf(file=paste0("results/383k_ModelPerformance_logY_c0.01/TenFoldCV_Alpha0.1/glmnet_log_y_c0.01_alpha", params$BestAlpha, "_ValidationMetric.pdf"), width=5, height=5)
+print(p)
+dev.off()
+```
+
+
+
+# R SESSION INFORMATION
+
+<details>
+<summary>Information about R, the OS and attached or loaded packages</summary>
+
+```{r sesion_info}
+pander::pander(sessionInfo(), compact = FALSE)
+```
+</details>
+***
+<center>`r format(Sys.time(), '%d %B %Y')`</center>
+
+
+

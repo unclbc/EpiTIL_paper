@@ -1,0 +1,536 @@
+---
+title: "Visualize Tuning Parameters Diag Plot from Elastic Net Model using 383k probes"
+author: "Siyao Liu, Ph.D. | Lineberger Bioinformatics Core"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output: 
+  rmdformats::downcute:
+      self_contained: true
+      thumbnails: false
+      lightbox: true
+      gallery: false
+      highlight: kate
+      toc_float: yes
+      toc_depth: 3
+      theme: cosmo
+      code_folding: hide
+params:
+  r33_data: "/datastore/lbcfs/labs/bioinformatics/wdgong/projects/Nancy_Thomas/TIL-prediction/data/r33_preProcessed.Rdata"
+  til_image: "/datastore/lbcfs/labs/bioinformatics/wdgong/projects/Nancy_Thomas/TIL-prediction/data/Alg5_selectedROI_091719.txt" # Image data from Shannon #ProcessedFiles_071118/CellrAnalysis_per_Slide_20170103-Alg4_350u_PGEM1599excluded_273added_groupByMaxNumberNucleus.txt
+  estF: "/datastore/lbcfs/labs/bioinformatics/wdgong/projects/Nancy_Thomas/TIL-prediction/results/Deconvolution/MethylDecon.rds" # data matrix from ../results/Deconvolution/Deconvolution_PGEM.Rmd
+# Use EpiDISH (RPC, CBS and CP) and MethylResolver to estimate T cell percentage
+# EpiDISH_CP provides the best R2 with IHC measured CD3+ T cell percentage (See ../results/Deconvolution/Decon.Til.scatter.pdf)
+  process_dir: "./processedData/"
+  results_dir: "./results/"
+  colors_file: "./scripts/R/colors.R"
+
+  knit_rdir: "/datastore/nextgenout5/share/labs/bioinformatics/siyao/projects/Thomas-Edmiston_20240711_PredictTILs/" 
+knit: (function(input_file, encoding) {
+  rmarkdown::render(input_file, 
+                              output_dir="/datastore/nextgenout5/share/labs/bioinformatics/siyao/projects/Thomas-Edmiston_20240711_PredictTILs/")}) 
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{=html}
+<style>
+mark {
+  background-color: #E6E6FA;
+  color: #000;
+  border: 1px solid #E6E6FA;
+  border-radius: 5px;
+  font-family: monospace;
+  
+}
+
+.page-content code {
+  background: #E6E6FA;
+  color: #000;
+}
+
+code {
+  background: #E6E6FA;
+  background-color: #E6E6FA;
+  color: #000;
+  border: 1px solid #E6E6FA;
+  border-radius: 5px;
+  font-family: monospace;
+}
+
+code-out {
+  background-color: #E6E6FA;
+  color: #000;
+  border: 1px solid #E6E6FA;
+  border-radius: 2px;
+}
+</style>
+```
+
+
+# Purpose
+
+# Set up
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, eval = TRUE, message = FALSE, warning = FALSE)
+# root dir is for input and necessary files 
+# knitr outdir (html) is set in yaml header
+# setting root.dir here creates process.dir and results.dir in user directory
+# but will cause issues with input files if absolute paths are not used.
+knitr::opts_knit$set(root.dir = params$knit_rdir)
+```
+
+## Load libraries
+
+```{r}
+library(kableExtra)
+library(caret)
+library(glmnet)
+library(dplyr)
+library(ggplot2)
+library(RColorBrewer)
+library(ComplexHeatmap)
+library(circlize)
+library(ggrepel)
+library(reshape2)
+library(randomForest)
+library(xgboost)
+library(cowplot)
+```
+
+## Functions
+
+```{r, load-functions}
+theme_90 <- function() {
+  theme_bw(base_size=12)+
+    theme(panel.grid.major = element_blank(), 
+          panel.grid.minor = element_blank(),
+          axis.text.x=element_text(angle=90,hjust = 1,vjust = 0.5),
+          axis.text=element_text(color="black"),
+          panel.background=element_rect(color="black"),
+          strip.text = element_text(size=12),
+          strip.background = element_rect(fill="white"))
+}
+
+theme_45 <- function() {
+  theme_bw(base_size=14)+
+    theme(panel.grid.major = element_blank(), 
+          panel.grid.minor = element_blank(),
+          axis.text.x=element_text(angle=45,hjust = 1.0,vjust = 1.0),
+          axis.text=element_text(color="black"),
+          panel.background=element_rect(color="black"),
+          strip.text = element_text(size=12),
+          strip.background = element_rect(fill="white"))
+}
+
+theme_0 <- function() {
+  theme_bw(base_size=14)+
+    theme(panel.grid.major = element_blank(), 
+          panel.grid.minor = element_blank(),
+      axis.text=element_text(color="black"),
+      panel.background=element_rect(color="black"),
+      strip.text = element_text(size=12),
+      strip.background = element_rect(fill="white"))
+}
+```
+
+
+## Parameters
+
+```{r, echo=FALSE, results="asis"}
+p <- unlist(list(params), recursive = FALSE)
+params.df <- data.frame(Parameter=names(p), Value=as.character(p))
+kable(params.df, booktabs = TRUE) %>%
+  kableExtra::kable_styling(font_size = 12)
+```
+
+
+## Colors
+
+Define customized colors.
+
+```{r, define-colors}
+alpha.colors <- scales::hue_pal()(11)
+names(alpha.colors) <- paste0("alpha_", seq(0, 1, 0.1))
+
+alpha.colors <-  c("#88CCEE", "#CC6677", "#DDCC77", "#117733", "#332288", "#AA4499", 
+                             "#44AA99", "#999933", "#882255", "#661100", "#6699CC")
+names(alpha.colors) <- paste0("alpha_", seq(0, 1, 0.1))
+#scales::show_col(alpha.colors)
+```
+
+
+# 10 fold cv, original y
+
+## Summarize results
+
+```{r, fig.width=13, fig.height=5}
+file.names <- list.files("results/383k_glmnet_TenFoldCrossVal/")
+file.names <- grep("*.rds", file.names, value = TRUE)
+file.names
+
+model.list <- list()
+df.list <- list()
+
+for (i in 1: length(file.names)) {
+  print(i)
+  model <- readRDS(file=paste0("results/383k_glmnet_TenFoldCrossVal/", file.names[i]))
+  
+  best.lambda.df <- data.frame("name" = names(unlist(lapply(model, function(x) x$lambda.1se))),
+                                 "lambda.1se" = unlist(lapply(model, function(x) x$lambda.1se)))
+  best.lambda.df$alpha <- gsub("alpha", "", best.lambda.df$name)
+    
+  results <- sapply(model, function(x) data.frame("lambda"=x$lambda, "cvm"=x$cvm), simplify = F, USE.NAMES = F)
+  results <- do.call("rbind", Map(cbind, Name = names(results), results))
+  results$alpha <- gsub("alpha", "", results$Name)
+  
+  # organize results
+  results <- results[!is.na(results$alpha) & !is.na(results$lambda),]
+  results$alpha <- as.factor(results$alpha)
+  results$log_lambda <- log10(results$lambda)
+    
+    
+  # plot
+  p1 <- ggplot(results, aes(x = log_lambda, y = cvm, group = alpha, color = alpha)) +
+      geom_line() +
+      geom_point(shape = 1) +
+      #theme_minimal(base_size = 14) +
+      # add vertical line for lambda.1se for each alpha
+      geom_vline(data = best.lambda.df, 
+                 lty = 2, mapping = aes(xintercept = log10(lambda.1se), color = alpha )) +
+      theme_0() +
+      ylab("MSE") +
+      xlab("Log10(lambda)") +
+      scale_color_discrete(name = "alpha") #+
+    #geom_vline(xintercept = log(best_obj$lambda.min), linetype = "dashed")
+  
+  df.line <- results[results$lambda%in% best.lambda.df$lambda.1se, ]
+  df.line$alpha <- as.numeric(df.line$alpha)
+  
+  p2 <- ggplot(results, aes(x = alpha, y = cvm, color = alpha)) +
+      geom_violin() +
+      #geom_point(aes(color = alpha), shape = 1) +
+      #theme_minimal(base_size = 14) +
+      geom_jitter(size=0.5, position = position_jitterdodge(jitter.width = 0.4, dodge.width = 0.9)) + 
+      
+      # add a line that connects the lambda.1se
+      geom_line(data=df.line, mapping=aes(x=alpha, y=cvm), color="black") + 
+      theme_0() + 
+      ylab("MSE") +
+      xlab("alpha") +
+      scale_color_discrete(name = "alpha")
+    
+  plot_row <- plot_grid(p1, p2)
+
+# now add the title
+title <- ggdraw() + 
+  draw_label(
+    paste0("Split ", i),
+    fontface = 'bold',
+    x = 0,
+    hjust = 0
+  ) #+
+  #theme(
+    # add margin on the left of the drawing canvas,
+    # so title is aligned with left edge of first plot
+  #  plot.margin = margin(0, 0, 0, 7)
+  #)
+
+print(plot_grid(
+  title, plot_row,
+  ncol = 1,
+  # rel_heights values control vertical title margins
+  rel_heights = c(0.1, 1)
+))
+  
+  model.list[[i]] <- model
+  
+  tmp.df <- sapply(model, function(x) data.frame("lambda.1se" = x$lambda.1se, 
+                                             "cvm" = x$cvm[which(x$lambda == x$lambda.1se)],
+                                             "cvsd" = x$cvsd[which(x$lambda == x$lambda.1se)]),
+    simplify = F, USE.NAMES = F)
+  df <- do.call("rbind", tmp.df)
+ 
+  df$alpha <- gsub("alpha", "", rownames(df))
+  df$split <- i
+  df.list[[i]] <- df
+
+}
+
+all.df <- do.call("rbind", df.list)
+rownames(all.df) <- NULL
+```
+
+## Violin plot
+
+```{r}
+p1 <- ggplot(all.df, aes(alpha, cvm, color=alpha)) +
+  #geom_boxplot() +
+  geom_violin() +
+  geom_jitter(position=position_jitter(0.2)) +
+  ylab("MSE") + 
+  theme_0() + ggtitle("original y")
+p1
+
+# reorder boxplots based on the mean
+#ggplot(all.df, aes(x=reorder(alpha, cvm), cvm, color=alpha)) +
+#  geom_boxplot() +
+#  geom_jitter(position=position_jitter(0.2)) +
+#  ylab("MSE") + 
+#  theme_0()
+
+# reorder boxplots based on the median
+#ggplot(all.df, aes(x=reorder(alpha, cvm, FUN = median), cvm, color=alpha)) +
+#  geom_boxplot() +
+#  geom_jitter(position=position_jitter(0.2)) +
+#  ylab("MSE") + 
+#  theme_0()
+```
+
+## Parallel coordinate plot
+
+```{r, eval=FALSE}
+library(GGally)
+all.df.m <- reshape(all.df[, c("cvm", "alpha", "split")], 
+                    idvar = c("split"), timevar = "alpha", direction = "wide",
+                    v.names = "cvm", sep= "_")
+colnames(all.df.m) <- gsub("cvm_", "", colnames(all.df.m))
+GGally::ggparcoord(data = all.df.m, columns = 2:12) + theme_0() + xlab("alpha") + ylab("MSE")
+```
+
+
+```{r}
+# customized parallel coordinate plot
+# set color for each curve as the alpha that has minimum MSE 
+tmp <- all.df %>% 
+  group_by(split) %>% 
+  summarise("alpha.color"= alpha[which.min(cvm)],
+             "min.cvm" = min(cvm))
+tmp  
+
+tmp$alpha.color <- paste("alpha", tmp$alpha.color, sep="_")
+length(alpha.colors[match(tmp$alpha.color, names(alpha.colors))])
+
+all.df$split <- factor(all.df$split, levels=c(1:10))
+
+split.colors <- alpha.colors[match(tmp$alpha.color, names(alpha.colors))]
+names(split.colors) <- as.character(c(1:10))
+
+p1.1 <- ggplot(all.df, aes(x=alpha, y=cvm, group=split, color=split)) +
+  geom_point(#size=2.5, 
+    pch=21, color="grey25", stroke=0.6) +
+   #geom_errorbar(aes(ymin=cvm-cvsd, ymax=cvm+cvsd), width=.2,
+   #              position=position_dodge(0.05)) +
+  geom_line(size=1.2) +
+  scale_color_manual("Fold", values=split.colors, 
+                     labels=paste(paste0("Fold ", c(1:10)), tmp$alpha.color, sep=": ")
+                     ) +
+  
+  ylab("MSE") +
+  theme_0() + ggtitle("original y")
+p1.1
+```
+
+## Check coefficients
+
+```{r}
+for (i in 1: length(model.list)) {
+  print(paste0("Round ", i))
+  model <- model.list[[i]]
+  print(paste0("Total # of probes with non-zero coefficients: ", sum(coef(model$alpha1, s=model$alpha1$lambda.1se)!=0)))
+  print(coef(model$alpha1, s=model$alpha1$lambda.1se)[coef(model$alpha1, s=model$alpha1$lambda.1se)!=0])
+}
+```
+
+
+
+
+
+# 10 fold cv, log10(y+0.01)
+
+## Summarize results
+
+```{r, fig.width=13, fig.height=5}
+file.names <- list.files("results/383k_glmnet_TenFoldCrossVal_logY_c0.01/")
+file.names <- grep("*.rds", file.names, value = TRUE)
+file.names
+
+model.list <- list()
+df.list <- list()
+for (i in 1: length(file.names)) {
+  print(i)
+  
+  model <- readRDS(file=paste0("results/383k_glmnet_TenFoldCrossVal_logY_c0.01/", file.names[i]))
+  
+  best.lambda.df <- data.frame("name" = names(unlist(lapply(model, function(x) x$lambda.1se))),
+                                 "lambda.1se" = unlist(lapply(model, function(x) x$lambda.1se)))
+  best.lambda.df$alpha <- gsub("alpha", "", best.lambda.df$name)
+    
+  results <- sapply(model, function(x) data.frame("lambda"=x$lambda, "cvm"=x$cvm), simplify = F, USE.NAMES = F)
+  results <- do.call("rbind", Map(cbind, Name = names(results), results))
+  results$alpha <- gsub("alpha", "", results$Name)
+  # organize results
+  results <- results[!is.na(results$alpha) & !is.na(results$lambda),]
+  results$alpha <- as.factor(results$alpha)
+  results$log_lambda <- log10(results$lambda)
+    
+    
+  # plot
+  p1 <- ggplot(results, aes(x = log_lambda, y = cvm, group = alpha, color = alpha)) +
+      geom_line() +
+      geom_point(shape = 1) +
+      #theme_minimal(base_size = 14) +
+      # add vertical line for lambda.1se for each alpha
+      geom_vline(data = best.lambda.df, 
+                 lty = 2, mapping = aes(xintercept = log10(lambda.1se), color = alpha )) +
+      theme_0() +
+      ylab("MSE") +
+      xlab("Log10(lambda)") +
+      scale_color_discrete(name = "alpha") #+
+    #geom_vline(xintercept = log(best_obj$lambda.min), linetype = "dashed")
+  
+  df.line <- results[results$lambda%in% best.lambda.df$lambda.1se, ]
+  df.line$alpha <- as.numeric(df.line$alpha)
+  
+  p2 <- ggplot(results, aes(x = alpha, y = cvm, color = alpha)) +
+      geom_violin() +
+      #geom_point(aes(color = alpha), shape = 1) +
+      #theme_minimal(base_size = 14) +
+      geom_jitter(size=0.5, position = position_jitterdodge(jitter.width = 0.4, dodge.width = 0.9)) + 
+      
+      # add a line that connects the lambda.1se
+      geom_line(data=df.line, mapping=aes(x=alpha, y=cvm), color="black") + 
+      theme_0() + 
+      ylab("MSE") +
+      xlab("alpha") +
+      scale_color_discrete(name = "alpha")
+    
+  plot_row <- plot_grid(p1, p2)
+
+# now add the title
+title <- ggdraw() + 
+  draw_label(
+    paste0("Split ", i),
+    fontface = 'bold',
+    x = 0,
+    hjust = 0
+  ) 
+print(plot_grid(
+  title, plot_row,
+  ncol = 1,
+  # rel_heights values control vertical title margins
+  rel_heights = c(0.1, 1)
+))
+  
+  
+  model.list[[i]] <- model
+  
+  tmp.df <- sapply(model, function(x) data.frame("lambda.1se" = x$lambda.1se, 
+                                             "cvm" = x$cvm[which(x$lambda == x$lambda.1se)],
+                                             "cvsd" = x$cvsd[which(x$lambda == x$lambda.1se)]),
+    simplify = F, USE.NAMES = F)
+  df <- do.call("rbind", tmp.df)
+ 
+  df$alpha <- gsub("alpha", "", rownames(df))
+  df$split <- i
+  df.list[[i]] <- df
+
+}
+
+all.df <- do.call("rbind", df.list)
+rownames(all.df) <- NULL
+```
+
+## Violin plot
+
+```{r}
+p2 <- ggplot(all.df, aes(alpha, cvm, color=alpha)) +
+  #geom_boxplot() +
+  geom_violin() +
+  geom_jitter(position=position_jitter(0.2)) +
+  ylab("MSE") + 
+  theme_0() + ggtitle("log10(y+0.01)")
+p2
+
+# reorder boxplots based on the mean
+#ggplot(all.df, aes(x=reorder(alpha, cvm), cvm, color=alpha)) +
+#  geom_boxplot() +
+#  geom_jitter(position=position_jitter(0.2)) +
+#  ylab("MSE") + 
+#  theme_0()
+
+# reorder boxplots based on the median
+#ggplot(all.df, aes(x=reorder(alpha, cvm, FUN = median), cvm, color=alpha)) +
+#  geom_boxplot() +
+#  geom_jitter(position=position_jitter(0.2)) +
+#  ylab("MSE") + 
+#  theme_0()
+```
+
+## Parallel coordinate plot
+
+```{r}
+# customized parallel coordinate plot
+# set color for each curve as the alpha that has minimum MSE 
+tmp <- all.df %>% 
+  group_by(split) %>% 
+  summarise("alpha.color"= alpha[which.min(cvm)],
+             "min.cvm" = min(cvm))
+tmp  
+tmp$alpha.color <- paste("alpha", tmp$alpha.color, sep="_")
+length(alpha.colors[match(tmp$alpha.color, names(alpha.colors))])
+all.df$split <- factor(all.df$split, levels=c(1:10))
+
+split.colors <- alpha.colors[match(tmp$alpha.color, names(alpha.colors))]
+names(split.colors) <- as.character(c(1:10))
+
+p1.2 <- ggplot(all.df, aes(x=alpha, y=cvm, group=split)) +
+  geom_point(#size=2.5, 
+             pch=21, color="grey25", stroke=0.6) +
+  geom_line(aes(color=split), 
+            #size=0.8,
+            size=1.2) +
+  scale_color_manual("Split", values=split.colors, 
+                     labels=paste(paste0("Fold ", c(1:10)), tmp$alpha.color, sep=": ")
+                     ) +
+  
+  ylab("MSE") +
+  theme_0() + ggtitle("log10(y+0.01)")
+p1.2
+```
+
+## Check coefficients
+
+```{r}
+for (i in 1: length(model.list)) {
+  print(paste0("Round ", i))
+  model <- model.list[[i]]
+  print(paste0("Total # of probes with non-zero coefficients: ", sum(coef(model$alpha1, s=model$alpha1$lambda.1se)!=0)))
+  print(coef(model$alpha1, s=model$alpha1$lambda.1se)[coef(model$alpha1, s=model$alpha1$lambda.1se)!=0])
+}
+```
+
+
+
+# Plot all together
+
+```{r, fig.width=12, fig.height=4}
+plot_grid(p1.1, p1.2, ncol=2)
+```
+
+
+# R SESSION INFORMATION
+
+<details>
+<summary>Information about R, the OS and attached or loaded packages</summary>
+
+```{r sesion_info}
+pander::pander(sessionInfo(), compact = FALSE)
+```
+</details>
+***
+<center>`r format(Sys.time(), '%d %B %Y')`</center>
+
+
+
+
