@@ -1,1 +1,474 @@
+---
+title: "Build Elastic Net Model using 383k probes"
+author: "Siyao Liu, Ph.D. | Lineberger Bioinformatics Core"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output: 
+  rmdformats::downcute:
+      self_contained: true
+      thumbnails: false
+      lightbox: true
+      gallery: false
+      highlight: kate
+      toc_float: yes
+      toc_depth: 3
+      theme: cosmo
+      code_folding: hide
+params:
+  r33_data: "/datastore/lbcfs/labs/bioinformatics/wdgong/projects/Nancy_Thomas/TIL-prediction/data/r33_preProcessed.Rdata"
+  til_image: "/datastore/lbcfs/labs/bioinformatics/wdgong/projects/Nancy_Thomas/TIL-prediction/data/Alg5_selectedROI_091719.txt" # Image data from Shannon #ProcessedFiles_071118/CellrAnalysis_per_Slide_20170103-Alg4_350u_PGEM1599excluded_273added_groupByMaxNumberNucleus.txt
+  estF: "/datastore/lbcfs/labs/bioinformatics/wdgong/projects/Nancy_Thomas/TIL-prediction/results/Deconvolution/MethylDecon.rds" # data matrix from ../results/Deconvolution/Deconvolution_PGEM.Rmd
+# Use EpiDISH (RPC, CBS and CP) and MethylResolver to estimate T cell percentage
+# EpiDISH_CP provides the best R2 with IHC measured CD3+ T cell percentage (See ../results/Deconvolution/Decon.Til.scatter.pdf)
+  process_dir: "./processedData/"
+  results_dir: "./results/"
+  colors_file: "./scripts/R/colors.R"
+  n_fold: 10
+
+  knit_rdir: "/datastore/nextgenout5/share/labs/bioinformatics/siyao/projects/Thomas-Edmiston_20240711_PredictTILs/" 
+knit: (function(input_file, encoding) {
+  rmarkdown::render(input_file, 
+                              output_dir="/datastore/nextgenout5/share/labs/bioinformatics/siyao/projects/Thomas-Edmiston_20240711_PredictTILs/")}) 
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{=html}
+<style>
+mark {
+  background-color: #E6E6FA;
+  color: #000;
+  border: 1px solid #E6E6FA;
+  border-radius: 5px;
+  font-family: monospace;
+  
+}
+
+.page-content code {
+  background: #E6E6FA;
+  color: #000;
+}
+
+code {
+  background: #E6E6FA;
+  background-color: #E6E6FA;
+  color: #000;
+  border: 1px solid #E6E6FA;
+  border-radius: 5px;
+  font-family: monospace;
+}
+
+code-out {
+  background-color: #E6E6FA;
+  color: #000;
+  border: 1px solid #E6E6FA;
+  border-radius: 2px;
+}
+</style>
+```
+
+
+# Purpose
+
+# Set up
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, eval = TRUE, message = FALSE, warning = FALSE)
+# root dir is for input and necessary files 
+# knitr outdir (html) is set in yaml header
+# setting root.dir here creates process.dir and results.dir in user directory
+# but will cause issues with input files if absolute paths are not used.
+knitr::opts_knit$set(root.dir = params$knit_rdir)
+```
+
+## Load libraries
+
+```{r}
+library(kableExtra)
+library(caret)
+library(glmnet)
+library(dplyr)
+library(ggplot2)
+library(RColorBrewer)
+library(ComplexHeatmap)
+library(circlize)
+library(ggrepel)
+library(reshape2)
+library(randomForest)
+library(xgboost)
+library(cowplot)
+```
+
+## Functions
+
+```{r, load-functions}
+theme_90 <- function() {
+  theme_bw(base_size=12)+
+    theme(panel.grid.major = element_blank(), 
+          panel.grid.minor = element_blank(),
+          axis.text.x=element_text(angle=90,hjust = 1,vjust = 0.5),
+          axis.text=element_text(color="black"),
+          panel.background=element_rect(color="black"),
+          strip.text = element_text(size=12),
+          strip.background = element_rect(fill="white"))
+}
+
+theme_45 <- function() {
+  theme_bw(base_size=14)+
+    theme(panel.grid.major = element_blank(), 
+          panel.grid.minor = element_blank(),
+          axis.text.x=element_text(angle=45,hjust = 1.0,vjust = 1.0),
+          axis.text=element_text(color="black"),
+          panel.background=element_rect(color="black"),
+          strip.text = element_text(size=12),
+          strip.background = element_rect(fill="white"))
+}
+
+theme_0 <- function() {
+  theme_bw(base_size=14)+
+    theme(panel.grid.major = element_blank(), 
+          panel.grid.minor = element_blank(),
+      axis.text=element_text(color="black"),
+      panel.background=element_rect(color="black"),
+      strip.text = element_text(size=12),
+      strip.background = element_rect(fill="white"))
+}
+```
+
+
+## Parameters
+
+```{r, echo=FALSE, results="asis"}
+p <- unlist(list(params), recursive = FALSE)
+params.df <- data.frame(Parameter=names(p), Value=as.character(p))
+kable(params.df, booktabs = TRUE) %>%
+  kableExtra::kable_styling(font_size = 12)
+```
+
+
+
+# Import data
+
+## Load r33 preprocessed data
+
+```{r, eval=FALSE}
+load(params$r33_data)
+
+y$r33_Sample_ID <- paste("X", y$r33_Sample_ID,".AVG_Beta", sep="")
+y <- y[y$r33_Sample_ID %in% colnames(xb), ]
+length(y)
+##[1] 252
+
+xb <- xb[, y$r33_Sample_ID]
+dim(xb)
+##[1] 383229    257
+dim(x)
+##[1] 383229    257
+identical(y$r33_Sample_ID, colnames(xb))
+```
+
+## Read image data TIL density
+
+```{r, eval=FALSE}
+mea <- read.table(params$til_image, header = T, sep="\t", check.names = F,
+                  row.names = 1, comment.char = "") 
+dim(mea)
+##[1] 160  27
+
+# extract sample ID number
+sample_ID_numbers_only <- sapply(rownames(mea), function(x){ gsub(" Bottom", "", gsub("^0", "", strsplit(x,split = "PGEM ")[[1]][2])) } ) # exception 6 cases in other algorithm: "1599 Exclude: folded"X2 , "1298 Top"X2 ,  "1298 Bottom"X2 
+length(sample_ID_numbers_only)
+##160
+```
+
+
+### Extract tumor region (80 samples)
+
+```{r, eval=FALSE}
+Tumor.region <- sapply(rownames(mea), function(x){ strsplit(x, split = " ")[[1]][1] } ) 
+
+### Marker1: CD3, Marker2: CD8, Marker3: nuclear 
+mea$CD3PCD8N.count <- mea$`# Cell Markers 1 and 3 coexpressed` 
+mea$CD3PCD8P.count <- mea$`# Cell Markers 1 and 2 and 3 coexpressed`
+mea$CD3PCD8N.density <- mea$`Density Cell Markers 1 and 3 coexpressed (#/mm²)`
+mea$CD3PCD8P.density <-  mea$`Density Cell Markers 1 and 2 and 3 coexpressed (#/mm²)`
+mea$TotalT.density <- mea$`Density Cell Markers 1 and 3 coexpressed (#/mm²)` + mea$`Density Cell Markers 1 and 2 and 3 coexpressed (#/mm²)`
+mea$CD3PCD8N.percent <- mea$`# Cell Markers 1 and 3 coexpressed` / mea$`# All Cells`
+mea$CD3PCD8P.percent <- mea$`# Cell Markers 1 and 2 and 3 coexpressed` / mea$`# All Cells`
+mea$nonT.percent <- mea$`# Cell Marker 3 (only)`  / mea$`# All Cells`
+mea$background.percent <-  mea$`# Cell Markers 2 and 3 coexpressed`  / mea$`# All Cells`
+
+mea <- data.frame(mea, sample_ID_numbers_only, Tumor.region, check.names=F)
+dim(mea)
+##[1] 160 x 36
+
+# subset Tumor core
+filt.core <- which(mea$Tumor.region == "Tumor_Core")
+length(filt.core)
+##[1] 80
+```
+
+
+### Calculate y variable (CD3+ T cell percentage)
+
+```{r, eval=FALSE}
+outcome <- mea$TotalT.density[filt.core] ### Total T cells
+outcome.perc <- (mea$CD3PCD8N.percent + mea$CD3PCD8P.percent)[filt.core]
+filt.id <- which(y$consensus_final_sample_type== "Melanoma" & y$r33_sample_ID_numbers_only %in% mea$sample_ID_numbers_only[filt.core])
+
+order <- match(y$r33_sample_ID_numbers_only[filt.id], mea$sample_ID_numbers_only[filt.core])
+outcome <- outcome[order]
+outcome.perc <- outcome.perc[order]
+# group outcome by tertiles
+outcome.cat <- cut(outcome, c(0, quantile(outcome, c(0.33,0.66)), 99999), labels = c("low", "med", "high"))
+head(outcome)
+head(outcome.perc)
+head(outcome.cat)
+```
+
+```{r, eval=FALSE}
+estF <- readRDS(params$estF) # data matrix from ../results/Deconvolution/Deconvolution_PGEM.Rmd
+# Use EpiDISH (RPC, CBS and CP) and MethylResolver to estimate T cell percentage
+# EpiDISH_CP provides the best R2 with IHC measured CD3+ T cell percentage (See ../results/Deconvolution/Decon.Til.scatter.pdf)
+estF <- estF$EpiDISH_CP # Best R2 with IHC TotalT
+```
+
+
+## Load Matrix X: 80 Melanoma samples x 383K QC'ed probes
+
+```{r, eval=FALSE}
+sub.xb <- data.frame(t(xb[, match(y$r33_Sample_ID[filt.id], colnames(xb))]), check.names = F)
+sub.xb$outcome <- outcome.perc
+sub.xb$outcome_cat <- outcome.cat
+sub.xb$TotalT <- estF$TotalT[match(rownames(sub.xb), rownames(estF))]
+dim(sub.xb)
+#saveRDS(sub.xb, file="processedData/231002_r33_383kProbes_Til-perc.rds")
+```
+
+
+```{r}
+sub.xb <- readRDS(file="/datastore/nextgenout5/share/labs/bioinformatics/siyao/projects/Siyao_20230908_PredictTILs/processedData/231002_r33_383kProbes_Til-perc.rds")
+dim(sub.xb)
+##[1]     80 383232
+```
+
+### Create X and Y
+
+```{r}
+all.x <- sub.xb[, -which(colnames(sub.xb) %in% c("outcome", "outcome_cat", "TotalT"))]
+dim(all.x)
+
+# response: CD3TIL perc -- same as outcome.perc
+all.y <- sub.xb$outcome
+length(all.y)
+```
+
+# Plot distribution of y (CD3Til-perc) 
+
+## Original data
+
+The distribution is heavily skewed to the right.
+
+```{r, fig.width=5, fig.height=4}
+hist(all.y) # right skewed
+min(all.y)
+##[1] 0.005602889
+```
+
+## Natural log transformation
+
+```{r, fig.width=5, fig.height=4}
+hist(log(all.y+0.001))
+```
+
+## Log10 transformation
+
+```{r, fig.width=5, fig.height=4}
+# use log10 if these is 0 in the data, log10 would be -3
+hist(log10(all.y))
+# exploring different shifts
+hist(log10(all.y+0.001)) # a little left skewed
+hist(log10(all.y+0.01))
+```
+
+
+# Ten fold cross validation to evaluate model performance
+
+## Manually create 10 folds in the whole dataset
+
+```{r}
+set.seed(555)
+SAMPLE_IDS <- rownames(all.x)
+n_fold <- params$n_fold
+# randomly shuffle the labels
+folds <- split(SAMPLE_IDS[sample(length(SAMPLE_IDS))],
+               cut(seq_along(SAMPLE_IDS), breaks = n_fold, labels = FALSE))
+```
+
+
+## Loop around each fold
+
+Within each round, do 10 fold cross validation to tune alpha and lambda parameters.
+
+
+### log10 transform y
+
+```{r}
+# log10 transform y since y looks right skewed
+C <- 0.01
+all.y <- log10(all.y + C)
+head(all.y)
+```
+
+
+### Build model
+
+```{r}
+# repeat random split of training and testing 10 times
+system.time(
+  for (i in 1:length(folds)) {
+    print(paste0("Fold ", i, " ..."))
+    print(head(folds[[i]]))
+    test_rows <- folds[[i]]
+    
+    train_x <- all.x[-which(rownames(all.x) %in% test_rows), ]
+    train_y <- all.y[-which(rownames(all.x) %in% test_rows)]
+
+    test_x <- all.x[which(rownames(all.x) %in% test_rows), ]
+    test_y <- all.y[which(rownames(all.x) %in% test_rows)]
+
+    nFold <- 10
+    
+    # set up alpha grid
+    alphas <- seq(0, 1, by = 0.1)
+    
+    # set up foldid to allow comparisons across alphas
+    set.seed(10)
+    
+    SAMPLE_IDS <- rownames(train_x)
+    nFold <- 10
+    # randomly shuffle the labels and cut into equal bins
+    folds.list <- split(SAMPLE_IDS[sample(length(SAMPLE_IDS))],
+               cut(seq_along(SAMPLE_IDS), breaks = nFold, labels = FALSE))
+    # convert to a data frame
+    folds.df <- do.call("cbind", folds.list)
+    colnames(folds.df) <- paste0("fold.", 1:nFold)
+    # convert from wide to long
+    folds.df2 <- reshape::melt(folds.df)
+    # reorder folds.df2 to be in the same order as train_x
+    folds.df2 <- folds.df2[match(rownames(train_x), folds.df2$value), ]
+    identical(folds.df2$value, rownames(train_x))
+    foldid <- as.numeric(gsub("fold.", "", folds.df2$X2))
+    head(foldid)
+    
+    # set up a data frame to store results
+    results <- data.frame(alpha = NA, lambda = NA, 
+                          cvm = NA, cvsd = NA)
+    
+    model.list <- list()
+    
+    # set up alpha grid
+    alphas <- seq(0, 1, by = 0.1)
+    # run cv.glmnet: default is tuning 100 lambdas for each alpha
+    for (alpha in alphas) {
+      
+      print(paste0("alpha: ", alpha))
+      
+      name <- paste0("alpha", alpha)
+      
+      # k-fold cross-validation for glmnet
+      obj <- glmnet::cv.glmnet(x = as.matrix(train_x), 
+                               y = train_y, 
+                               family = "gaussian", 
+                               type.measure = "mse", #based on mean squared error criterion (default for gaussian)
+                               alpha = alpha, 
+                               nfolds = n_fold,
+                               foldid = foldid)
+      model.list[[name]] <- obj
+      
+      # output results
+      results <- rbind(results, data.frame(alpha = alpha, 
+                                           lambda = obj$lambda, 
+                                           cvm = obj$cvm, 
+                                           cvsd = obj$cvsd))
+    }
+    
+    
+    results <- results[!is.na(results$alpha) & !is.na(results$lambda),]
+    results$alpha <- as.factor(results$alpha)
+    results$log_lambda <- log10(results$lambda)
+    
+    best.lambda.df <- data.frame("name" = names(unlist(lapply(model.list, function(x) x$lambda.1se))),
+                                 "lambda.1se" = unlist(lapply(model.list, function(x) x$lambda.1se)))
+    best.lambda.df$alpha <- gsub("alpha", "", best.lambda.df$name)
+    
+    
+    # plot
+    p1 <- ggplot(results, aes(x = log_lambda, y = cvm, group = alpha, color = alpha)) +
+      geom_line() +
+      geom_point(shape = 1) +
+      # add vertical line for lambda.1se for each alpha
+      geom_vline(data = best.lambda.df, 
+                 lty = 2, mapping = aes(xintercept = log10(lambda.1se), color = alpha )) +
+      theme_0() +
+      ylab("MSE") +
+      xlab("Log10(lambda)") +
+      scale_color_discrete(name = "alpha")
+    p1
+    
+    # violin plot
+    df.line <- results[results$lambda%in% best.lambda.df$lambda.1se, ]
+    df.line$alpha <- as.numeric(df.line$alpha)
+    
+    p2 <- ggplot(results, aes(x = alpha, y = cvm, color = alpha)) +
+      geom_violin(aes(color = alpha)) +
+      geom_jitter(size=0.5, position = position_jitterdodge(jitter.width = 0.4, dodge.width = 0.9)) + 
+      # add a line that connects the lambda.1se
+      geom_line(data=df.line, mapping=aes(x=alpha, y=cvm), color="black") + 
+      theme_0() + 
+      ylab("MSE") +
+      xlab("alpha") +
+      scale_color_discrete(name = "alpha")
+    
+    plot_row <- plot_grid(p1, p2)
+    
+    # now add the title
+    title <- ggdraw() + draw_label(
+    paste0("Fold ", i),
+    fontface = 'bold',
+    x = 0,
+    hjust = 0)
+    
+    # save plot
+    pdf(file=paste0(params$results_dir, "383k_glmnet_TenFoldCrossVal_logY_c0.01/Fold", i,"_", format(Sys.time(), "%b%d_%Y_%H"), "_TuneParaDiagPlot.pdf"), width=10, height=3.5)
+    #print(plot_grid(p1, p2, ncol=2))
+    print(plot_grid(title, plot_row, ncol = 1,
+                    # rel_heights values control vertical title margins
+                    rel_heights = c(0.1, 1)
+))
+    dev.off()
+    # save .rds file
+    saveRDS(model.list, 
+            file=paste0("results/383k_glmnet_TenFoldCrossVal_logY_c0.01/Fold", i,"_", format(Sys.time(), "%b%d_%Y_%H"), "_models.rds"))
+  
+  }
+)
+```
+
+
+
+# R SESSION INFORMATION
+
+<details>
+<summary>Information about R, the OS and attached or loaded packages</summary>
+
+```{r sesion_info}
+pander::pander(sessionInfo(), compact = FALSE)
+```
+</details>
+***
+<center>`r format(Sys.time(), '%d %B %Y')`</center>
+
+
+
 
